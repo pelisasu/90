@@ -2,11 +2,13 @@ name: APEX-QUANT-OMNI XAUUSD Signal Bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [telegram_check]
   workflow_dispatch:
     inputs:
       command:
-        description: "Mode eksekusi manual (auto / check / scalp / swing / status)"
+        description: "Mode eksekusi manual (auto / check / scalp / swing / status / chart / history)"
         required: false
         default: "auto"
         type: choice
@@ -16,6 +18,8 @@ on:
           - scalp
           - swing
           - status
+          - chart
+          - history
 
 permissions:
   contents: read
@@ -62,7 +66,7 @@ jobs:
           RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT || '1.0' }}
           SPREAD_USD: ${{ vars.SPREAD_USD || '0.30' }}
           SLIPPAGE_USD: ${{ vars.SLIPPAGE_USD || '0.10' }}
-          BOT_COMMAND: ${{ github.event.inputs.command || 'auto' }}
+          BOT_COMMAND: ${{ github.event.inputs.command || github.event.client_payload.command || 'auto' }}
         run: |
           python -u bot.py
 
