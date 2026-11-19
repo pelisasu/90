@@ -8,18 +8,28 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "Mode eksekusi manual (auto / check / scalp / swing / status / chart / history)"
+        description: "Mode eksekusi manual"
         required: false
         default: "auto"
         type: choice
         options:
           - auto
           - check
+          - sniper
           - scalp
           - swing
           - status
           - chart
           - history
+      tier_mode:
+        description: "Filter Tier Sinyal (BOTH = Pro + Sniper | SNIPER_ONLY = A+ Saja)"
+        required: false
+        default: "BOTH"
+        type: choice
+        options:
+          - BOTH
+          - SNIPER_ONLY
+          - PRO_ONLY
 
 permissions:
   contents: read
@@ -66,6 +76,7 @@ jobs:
           RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT || '1.0' }}
           SPREAD_USD: ${{ vars.SPREAD_USD || '0.30' }}
           SLIPPAGE_USD: ${{ vars.SLIPPAGE_USD || '0.10' }}
+          SIGNAL_TIER_MODE: ${{ github.event.inputs.tier_mode || vars.SIGNAL_TIER_MODE || 'BOTH' }}
           BOT_COMMAND: ${{ github.event.inputs.command || github.event.client_payload.command || 'auto' }}
         run: |
           python -u bot.py
