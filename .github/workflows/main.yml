@@ -2,7 +2,6 @@ name: APEX-QUANT-OMNI XAUUSD Signal Bot
 
 on:
   schedule:
-    # Berjalan setiap 10 menit secara otomatis untuk monitoring Scalping, Swing, Trailing SL & /check
     - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
@@ -55,6 +54,7 @@ jobs:
 
       - name: Execute APEX-QUANT-OMNI Engine
         env:
+          PYTHONUNBUFFERED: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -64,7 +64,7 @@ jobs:
           SLIPPAGE_USD: ${{ vars.SLIPPAGE_USD || '0.10' }}
           BOT_COMMAND: ${{ github.event.inputs.command || 'auto' }}
         run: |
-          python bot.py
+          python -u bot.py
 
       - name: Upload State DB & Backtest Performance Artifact
         if: always()
