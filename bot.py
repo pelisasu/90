@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APEX-QUANT-OMNI — HYPERION PRECISION EDITION (FINAL PRODUCTION)
-Dual-Mode (SCALP & SWING) + Dual-Tier (PRO & SNIPER) XAUUSD Signal Engine.
-Includes Multi-Source MT5 Spot Failover, Intermarket DXY/US10Y Veto,
-High-Impact USD News Blackout, Additive FVG + SMC + Order Flow + Z-Score,
-Walk-Forward 70/30 OOS Optimization, L2 Logistic Calibration, Auto-Trailing SL,
-SQLite Persistence, and Concise 2-Way Telegram Alerts.
+APEX-QUANT-OMNI — HYPERION APEX EDITION (PRODUCTION-READY)
+Self-Correcting High-Precision Dual-Mode (SCALP & SWING) + Dual-Tier (PRO & SNIPER)
+XAUUSD (Spot Gold) Quantitative Signal Engine.
+
+Core Engineering & Quantitative Architecture:
+1. Multi-Source Spot Gold Failover (XAUUSD=X / BiQuote / Swissquote / Kraken PAXGUSD / Yahoo)
+   with strict futures exclusion (no GC=F), MultiIndex flattening, NaN/spike sanitization,
+   cross-source depeg guard, open-candle trimming, and volatility shock circuit guard.
+2. Dual-Mode Strict Confluence (>95% pillar/regime/MTF criteria):
+   - SCALP (5M exec / 15M mid / 1H HTF): Fast ATR SL, 1.15R / 2.00R / 3.00R targets.
+   - SWING (15M exec / 1H mid / 4H HTF): Swing-anchored ATR SL, 1.50R / 2.50R / 4.00R targets.
+3. 5-Pillar Quantitative Model + FVG + Intermarket DXY/US10Y Veto + High-Impact USD News Blackout:
+   - Pillar I: Causal SMC (Swing High/Low, BOS, ChoCh, Liquidity Sweep, FVG).
+   - Pillar II: Volume/Range-Weighted Order Flow & Rolling VWAP Edge (anti-wick-trap).
+   - Pillar III: Zero-Protected Dual-Zone Z-Score Mean-Reversion / Momentum Continuation.
+   - Pillar IV: Strict Multi-Timeframe Fractal Harmony (closed-bar causal merge_asof).
+   - Pillar V: Market Regime Purity (KER, ADX, Choppiness Index, Session Governor).
+4. Walk-Forward 70/30 Out-of-Sample Grid Search (ATR [10, 14, 20] x Z [1.5, 2.0, 2.5])
+   with Half-Split Consistency Penalty, Dynamic Volatility-Scaled Slippage & Real Spread,
+   plus Regularized L2 Logistic Probability Calibrator + Bayesian Shrinkage.
+5. Chronological Bar-by-Bar Auto-Trailing Stop Engine, MT5 Lot Sizing, SQLite WAL Persistence,
+   Forensic Audit Logger, Agg Backtest Charting, Exponential Backoff Delivery, Circuit Breaker,
+   and 2-Way Authenticated Telegram Command Handler (/check, /scalp, /swing, /sniper, /status, /chart, /history).
 """
 
 import os
@@ -71,8 +88,15 @@ RETRY_BACKOFFS = [2, 4, 8]
 CIRCUIT_MAX_FAILURES = 5
 CIRCUIT_COOLDOWN_MINUTES = 60
 
-GRID_ATR_PERIODS = [14, 20, 26]
+GRID_ATR_PERIODS = [10, 14, 20]
 GRID_Z_THRESHOLDS = [1.5, 2.0, 2.5]
+
+INTERVAL_MINUTES = {
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,7 @@ class ModeConfig:
     trail_atr_mult: float
     min_score: float
     sniper_score: float
+    min_confluence_pct: float
     min_ker: float
     max_chop: float
     min_adx: float
@@ -112,11 +137,12 @@ SCALP_CONFIG = ModeConfig(
     trail_atr_mult=1.00,
     min_score=76.0,
     sniper_score=86.0,
+    min_confluence_pct=95.0,
     min_ker=0.33,
     max_chop=56.0,
     min_adx=19.0,
     cooldown_minutes=30,
-    min_backtest_trades=10,
+    min_backtest_trades=8,
     z_window=20,
     vwap_window=48,
     swing_lr=3,
@@ -132,11 +158,12 @@ SWING_CONFIG = ModeConfig(
     mid_tf="1h",
     htf_tf="4h",
     sl_atr_mult=1.85,
-    tp_r_multiples=(1.25, 2.50, 4.00),
+    tp_r_multiples=(1.50, 2.50, 4.00),
     tp1_close_pct=0.50,
     trail_atr_mult=0.80,
     min_score=75.0,
     sniper_score=86.0,
+    min_confluence_pct=95.0,
     min_ker=0.34,
     max_chop=56.0,
     min_adx=20.0,
@@ -165,6 +192,7 @@ class SignalCandidate:
     lot_size: float = 0.01
     risk_usd: float = 0.0
     score: float = 0.0
+    confluence_pct: float = 0.0
     p_win: float = 0.0
     ev_r: float = 0.0
     ker: float = 0.0
@@ -216,13 +244,15 @@ def calculate_mt5_lot_size(
     if sl_distance <= 1e-6 or account_balance <= 0 or risk_pct <= 0:
         return MIN_LOT
     risk_usd = account_balance * (risk_pct / 100.0)
-    raw_lot = risk_usd / ((sl_distance / PIP_SIZE) * (CONTRACT_SIZE * PIP_SIZE) + 1e-8)
-    rounded_lot = math.floor(raw_lot / LOT_STEP) * LOT_STEP
+    pip_value_per_lot = CONTRACT_SIZE * PIP_SIZE
+    sl_pips = sl_distance / PIP_SIZE
+    raw_lot = risk_usd / (sl_pips * pip_value_per_lot)
+    rounded_lot = math.floor((raw_lot + 1e-9) / LOT_STEP) * LOT_STEP
     return max(MIN_LOT, min(MAX_LOT, round(rounded_lot, 2)))
 
 
 # ==============================================================================
-# SQLITE STATE MANAGER
+# SQLITE STATE MANAGER (WAL PERSISTENCE & DEDUPLICATION)
 # ==============================================================================
 class StateManager:
     def __init__(self, db_path: str = DB_PATH) -> None:
@@ -230,8 +260,10 @@ class StateManager:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=15)
+        conn = sqlite3.connect(self.db_path, timeout=20)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
     def _init_db(self) -> None:
@@ -251,6 +283,7 @@ class StateManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mode TEXT NOT NULL,
                     direction TEXT NOT NULL,
+                    tier TEXT NOT NULL DEFAULT 'PRO',
                     entry REAL NOT NULL,
                     initial_sl REAL NOT NULL,
                     current_sl REAL NOT NULL,
@@ -270,6 +303,9 @@ class StateManager:
                 )
                 """
             )
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(signals)").fetchall()}
+            if "tier" not in cols:
+                conn.execute("ALTER TABLE signals ADD COLUMN tier TEXT NOT NULL DEFAULT 'PRO'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_mode_ts ON signals(mode, candle_ts)")
             conn.commit()
@@ -338,7 +374,7 @@ class StateManager:
                 elapsed_min = (utc_now() - datetime.fromisoformat(last_sig["created_at"])).total_seconds() / 60.0
                 if elapsed_min < cooldown_minutes:
                     return True, f"COOLDOWN_ACTIVE_{elapsed_min:.1f}m/{cooldown_minutes}m"
-                if last_sig["direction"] != direction and elapsed_min < (cooldown_minutes * 2.0) and score < 88.0:
+                if last_sig["direction"] != direction and elapsed_min < (cooldown_minutes * 2.0) and score < 90.0:
                     return True, f"ANTI_WHIPSAW_FLIP_GUARD_{elapsed_min:.1f}m"
         return False, ""
 
@@ -348,14 +384,14 @@ class StateManager:
             cur = conn.execute(
                 """
                 INSERT INTO signals (
-                    mode, direction, entry, initial_sl, current_sl,
+                    mode, direction, tier, entry, initial_sl, current_sl,
                     tp1, tp2, tp3, lot_size, score, p_win, ev_r,
                     atr, regime, status, candle_ts, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
                 """,
                 (
-                    sig.mode, sig.direction, sig.entry, sig.sl, sig.sl,
+                    sig.mode, sig.direction, sig.tier, sig.entry, sig.sl, sig.sl,
                     sig.tp1, sig.tp2, sig.tp3, sig.lot_size, sig.score,
                     sig.p_win, sig.ev_r, sig.atr, sig.regime, sig.candle_ts,
                     now_s, now_s,
@@ -503,7 +539,7 @@ class Notifier:
                 logger.warning(f"Unauthorized Telegram command from chat_id={chat_id}")
                 continue
             cmd_norm = text.lower().split("@")[0].strip()
-            if any(cmd_norm.startswith(p) for p in ("/check", "/status", "/chart", "/history", "/sniper", "/help")):
+            if any(cmd_norm.startswith(p) for p in ("/check", "/scalp", "/swing", "/status", "/chart", "/history", "/sniper", "/help")):
                 commands.append((chat_id, text))
 
         if max_uid >= offset:
@@ -647,13 +683,37 @@ class MarketDataEngine:
         bar_range_pct = ((df["High"] - df["Low"]) / (df["Close"] + 1e-8)).fillna(0.0)
         return df[(pct_jump < 0.045) & (bar_range_pct < 0.055)]
 
+    @staticmethod
+    def _drop_open_candle(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        mins = INTERVAL_MINUTES.get(interval, 15)
+        now = utc_now()
+        last_open = df.index[-1].to_pydatetime()
+        if (last_open + timedelta(minutes=mins)) > now:
+            return df.iloc[:-1].copy()
+        return df
+
+    @staticmethod
+    def _resample_4h_causal(df_1h: pd.DataFrame) -> pd.DataFrame:
+        if df_1h.empty:
+            return pd.DataFrame()
+        df_4h = (
+            df_1h.resample("4h", label="left", closed="left")
+            .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+            .dropna(subset=["Open", "High", "Low", "Close"])
+        )
+        return MarketDataEngine._drop_open_candle(df_4h, "4h")
+
     def fetch_live_spot_quote(self) -> Dict[str, Any]:
         quotes: Dict[str, Dict[str, float]] = {}
         try:
             r = requests.get("https://biquote.io/api/XAUUSD", headers=self.HEADERS, timeout=8)
             if r.status_code == 200:
                 q = r.json()
-                bid, ask, mid = float(q.get("bid", 0) or 0), float(q.get("ask", 0) or 0), float(q.get("mid", 0) or 0)
+                bid = float(q.get("bid", 0) or 0)
+                ask = float(q.get("ask", 0) or 0)
+                mid = float(q.get("mid", 0) or 0)
                 if mid > 100.0:
                     spread = abs(ask - bid) if (ask > bid > 100.0) else float(q.get("spread", SPREAD_USD) or SPREAD_USD)
                     quotes["biquote"] = {"mid": mid, "spread": spread}
@@ -671,7 +731,8 @@ class MarketDataEngine:
                 if isinstance(arr, list) and arr:
                     prices = arr[0].get("spreadProfilePrices") or []
                     if prices:
-                        bid, ask = float(prices[0].get("bid", 0) or 0), float(prices[0].get("ask", 0) or 0)
+                        bid = float(prices[0].get("bid", 0) or 0)
+                        ask = float(prices[0].get("ask", 0) or 0)
                         if bid > 100.0 and ask > 100.0:
                             quotes["swissquote"] = {"mid": (bid + ask) / 2.0, "spread": abs(ask - bid)}
         except Exception:
@@ -707,7 +768,7 @@ class MarketDataEngine:
             ]
             df = pd.DataFrame(records)
             df.index = pd.to_datetime(df["Time"], utc=True, errors="coerce")
-            return self._sanitize_ohlcv(df[["Open", "High", "Low", "Close", "Volume"]])
+            return self._drop_open_candle(self._sanitize_ohlcv(df[["Open", "High", "Low", "Close", "Volume"]]), interval)
         except Exception:
             return pd.DataFrame()
 
@@ -730,7 +791,7 @@ class MarketDataEngine:
                 return pd.DataFrame()
             df = pd.DataFrame(rows[:-1], columns=["Time", "Open", "High", "Low", "Close", "VWAP", "Volume", "Count"])
             df.index = pd.to_datetime(df["Time"].astype(float), unit="s", utc=True)
-            return self._sanitize_ohlcv(df[["Open", "High", "Low", "Close", "Volume"]])
+            return self._drop_open_candle(self._sanitize_ohlcv(df[["Open", "High", "Low", "Close", "Volume"]]), interval)
         except Exception:
             return pd.DataFrame()
 
@@ -740,7 +801,8 @@ class MarketDataEngine:
                 tickers=symbol, period=period, interval=interval,
                 auto_adjust=False, progress=False, threads=False, timeout=15,
             )
-            return self._sanitize_ohlcv(raw)
+            clean = self._sanitize_ohlcv(raw)
+            return self._drop_open_candle(clean, interval)
         except Exception:
             return pd.DataFrame()
 
@@ -770,39 +832,59 @@ class MarketDataEngine:
                     },
                     index=pd.to_datetime(ts, unit="s", utc=True),
                 )
-                clean = self._sanitize_ohlcv(df)
+                clean = self._drop_open_candle(self._sanitize_ohlcv(df), interval)
                 if not clean.empty:
                     return clean
             except Exception:
                 continue
         return pd.DataFrame()
 
-    def fetch_timeframe(self, interval: str, period: str, min_rows: int = 120) -> Tuple[pd.DataFrame, str]:
+    def fetch_timeframe(self, interval: str, period: str, min_rows: int = 120, spot_ref: float = 0.0) -> Tuple[pd.DataFrame, str]:
+        yf_interval = "1h" if interval == "4h" else interval
         sources = [
             ("BIQUOTE:XAUUSD", lambda: self._fetch_biquote_ohlc(interval, limit=500)),
+            ("YF:XAUUSD=X", lambda: self._fetch_yfinance("XAUUSD=X", yf_interval, period)),
+            ("YAPI:XAUUSD=X", lambda: self._fetch_yahoo_chart_api("XAUUSD=X", yf_interval, period)),
+            ("YAPI:XAU=X", lambda: self._fetch_yahoo_chart_api("XAU=X", yf_interval, period)),
             ("KRAKEN:PAXGUSD", lambda: self._fetch_kraken_paxg(interval)),
-            ("YF:PAXG-USD", lambda: self._fetch_yfinance("PAXG-USD", "1h" if interval == "4h" else interval, period)),
-            ("YAPI:XAU=X", lambda: self._fetch_yahoo_chart_api("XAU=X", "1h" if interval == "4h" else interval, period)),
+            ("YF:PAXG-USD", lambda: self._fetch_yfinance("PAXG-USD", yf_interval, period)),
         ]
         for name, loader in sources:
             df = loader()
             if df.empty:
                 continue
-            if interval == "4h" and name in ("YF:PAXG-USD", "YAPI:XAU=X"):
-                df = (
-                    df.resample("4h")
-                    .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-                    .dropna(subset=["Open", "High", "Low", "Close"])
-                )
-            if len(df) >= min_rows:
-                logger.info(f"Data [{interval}] loaded from {name} ({len(df)} bars, last={df.index[-1]})")
-                return df, name
+            if interval == "4h" and name in ("YF:XAUUSD=X", "YAPI:XAUUSD=X", "YAPI:XAU=X", "YF:PAXG-USD"):
+                df = self._resample_4h_causal(df)
+            if len(df) < min_rows:
+                continue
+            # Cross-source spot alignment check if PAXG proxy diverges > 1.5% from live XAUUSD spot
+            if "PAXG" in name and spot_ref > 100.0:
+                last_c = float(df["Close"].iloc[-1])
+                if abs(last_c - spot_ref) / spot_ref > 0.015:
+                    logger.warning(f"Skipping {name}: depeg vs spot ({last_c:.2f} vs {spot_ref:.2f})")
+                    continue
+            logger.info(f"Data [{interval}] loaded from {name} ({len(df)} bars, last={df.index[-1]})")
+            return df, name
         return pd.DataFrame(), "NONE"
 
     def load_deep_calibration_history(self, spot_reference: float) -> Dict[str, Tuple[pd.DataFrame, str]]:
-        df_5m = self._fetch_yfinance("PAXG-USD", "5m", "55d")
-        df_15m = self._fetch_yfinance("PAXG-USD", "15m", "55d")
-        df_1h = self._fetch_yfinance("PAXG-USD", "1h", "90d")
+        df_5m = self._fetch_yfinance("XAUUSD=X", "5m", "55d")
+        if len(df_5m) < 250:
+            df_5m = self._fetch_yfinance("PAXG-USD", "5m", "55d")
+        if len(df_5m) < 250:
+            df_5m = self._fetch_yahoo_chart_api("PAXG-USD", "5m", "45d")
+
+        df_15m = self._fetch_yfinance("XAUUSD=X", "15m", "55d")
+        if len(df_15m) < 250:
+            df_15m = self._fetch_yfinance("PAXG-USD", "15m", "55d")
+        if len(df_15m) < 250:
+            df_15m = self._fetch_yahoo_chart_api("PAXG-USD", "15m", "55d")
+
+        df_1h = self._fetch_yfinance("XAUUSD=X", "1h", "90d")
+        if len(df_1h) < 250:
+            df_1h = self._fetch_yfinance("PAXG-USD", "1h", "90d")
+        if len(df_1h) < 250:
+            df_1h = self._fetch_yahoo_chart_api("PAXG-USD", "1h", "90d")
 
         out: Dict[str, Tuple[pd.DataFrame, str]] = {}
         for label, df_raw in [("5m", df_5m), ("15m", df_15m), ("1h", df_1h)]:
@@ -817,19 +899,14 @@ class MarketDataEngine:
                 continue
             if spot_reference > 100.0:
                 ratio = spot_reference / float(df_fx["Close"].iloc[-1])
-                if 0.90 <= ratio <= 1.10:
+                if 0.90 <= ratio <= 1.10 and abs(ratio - 1.0) > 0.0005:
                     for col in ["Open", "High", "Low", "Close"]:
                         df_fx[col] = df_fx[col] * ratio
-            out[label] = (df_fx, "YF:PAXG-USD(55D-FX)")
+            out[label] = (df_fx, "DEEP_FX_SPOT_CAL")
 
         df_1h_cal, src_1h = out.get("1h", (pd.DataFrame(), "NONE"))
         if not df_1h_cal.empty:
-            df_4h_cal = (
-                df_1h_cal.resample("4h")
-                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-                .dropna(subset=["Open", "High", "Low", "Close"])
-            )
-            out["4h"] = (df_4h_cal, f"{src_1h}->4h")
+            out["4h"] = (self._resample_4h_causal(df_1h_cal), f"{src_1h}->4h")
         else:
             out["4h"] = (pd.DataFrame(), "NONE")
         return out
@@ -851,17 +928,13 @@ class MarketDataEngine:
             return False, f"VOLATILITY_SHOCK_ATR_RATIO={(atr_fast/(atr_base+1e-8)):.2f}"
         return True, "OK"
 
-    def load_all_timeframes(self) -> Dict[str, Tuple[pd.DataFrame, str]]:
-        df_5m, src_5m = self.fetch_timeframe("5m", "10d", min_rows=120)
-        df_15m, src_15m = self.fetch_timeframe("15m", "30d", min_rows=120)
-        df_1h, src_1h = self.fetch_timeframe("1h", "90d", min_rows=120)
-        df_4h, src_4h = self.fetch_timeframe("4h", "180d", min_rows=100)
+    def load_all_timeframes(self, spot_ref: float = 0.0) -> Dict[str, Tuple[pd.DataFrame, str]]:
+        df_5m, src_5m = self.fetch_timeframe("5m", "10d", min_rows=120, spot_ref=spot_ref)
+        df_15m, src_15m = self.fetch_timeframe("15m", "30d", min_rows=120, spot_ref=spot_ref)
+        df_1h, src_1h = self.fetch_timeframe("1h", "90d", min_rows=120, spot_ref=spot_ref)
+        df_4h, src_4h = self.fetch_timeframe("4h", "180d", min_rows=100, spot_ref=spot_ref)
         if df_4h.empty and not df_1h.empty:
-            df_4h = (
-                df_1h.resample("4h")
-                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-                .dropna(subset=["Open", "High", "Low", "Close"])
-            )
+            df_4h = self._resample_4h_causal(df_1h)
             src_4h = f"{src_1h}->4h"
         return {"5m": (df_5m, src_5m), "15m": (df_15m, src_15m), "1h": (df_1h, src_1h), "4h": (df_4h, src_4h)}
 
@@ -1135,7 +1208,7 @@ class QuantFeatureEngine:
         if cfg.mode_name == "SCALP" and not is_peak_london_ny_session(ts_dt):
             eff_ker = max(cfg.min_ker, 0.42)
             eff_adx = max(cfg.min_adx, 23.0)
-            eff_score = max(cfg.min_score, 82.0)
+            eff_score = max(cfg.min_score, 84.0)
 
         if chop > cfg.max_chop and ker < eff_ker:
             return "CHOPPY_SIDEWAYS", False, eff_score
@@ -1153,7 +1226,7 @@ class QuantFeatureEngine:
         check_session: bool = True, dxy_dir: int = 0,
     ) -> Tuple[str, float, str, Dict[str, Any]]:
         if idx < 60 or idx >= len(df):
-            return "NO_SIGNAL", 0.0, "WARMUP", {"reason": "WARMUP"}
+            return "NO_SIGNAL", 0.0, "WARMUP", {"reason": "WARMUP", "confluence_pct": 0.0}
 
         row = df.iloc[idx]
         ts_dt = df.index[idx].to_pydatetime()
@@ -1161,11 +1234,11 @@ class QuantFeatureEngine:
         if check_session:
             sess_ok, sess_reason = is_market_open(ts_dt)
             if not sess_ok:
-                return "NO_SIGNAL", 0.0, sess_reason, {"reason": sess_reason}
+                return "NO_SIGNAL", 0.0, sess_reason, {"reason": sess_reason, "confluence_pct": 0.0}
 
         regime, tradeable, eff_min_score = cls.classify_regime(row, cfg, ts_dt)
         if not tradeable:
-            return "NO_SIGNAL", 0.0, regime, {"reason": f"REGIME_BLOCK:{regime}"}
+            return "NO_SIGNAL", 0.0, regime, {"reason": f"REGIME_BLOCK:{regime}", "confluence_pct": 0.0}
 
         close, ema20, ema50 = float(row["Close"]), float(row["ema20"]), float(row["ema50"])
         z_val = float(row["z_score"])
@@ -1225,15 +1298,21 @@ class QuantFeatureEngine:
             bear_score += 10.0
 
         # Pillar III: Dual-Zone Z-Score (15 pts)
+        bull_z_ok = False
         if (-z_thresh <= z_val <= 1.0) and (z_val > z_prev) and close > ema50:
             bull_score += 15.0 if z_prev < -0.30 else 11.0
+            bull_z_ok = True
         elif (1.0 < z_val <= z_thresh) and (z_val >= z_prev) and ker >= 0.45 and close > ema50:
             bull_score += 10.0
+            bull_z_ok = True
 
+        bear_z_ok = False
         if (-1.0 <= z_val <= z_thresh) and (z_val < z_prev) and close < ema50:
             bear_score += 15.0 if z_prev > 0.30 else 11.0
+            bear_z_ok = True
         elif (-z_thresh <= z_val < -1.0) and (z_val <= z_prev) and ker >= 0.45 and close < ema50:
             bear_score += 10.0
+            bear_z_ok = True
 
         # Pillar V: Regime Purity + VWAP Edge (15 pts)
         regime_pts = min(9.0, (ker / 0.60) * 5.0 + (min(adx, 40.0) / 40.0) * 4.0)
@@ -1247,7 +1326,7 @@ class QuantFeatureEngine:
         elif vwap_dist >= -2.4:
             bear_score += regime_pts
 
-        # Additive FVG Bonus (+5) — strictly historical & live consistent
+        # Additive FVG Bonus (+5)
         if recent_fvg_bull:
             bull_score += 5.0
         if recent_fvg_bear:
@@ -1256,28 +1335,50 @@ class QuantFeatureEngine:
         bull_tech_score = min(100.0, bull_score)
         bear_tech_score = min(100.0, bear_score)
 
-        # Live Intermarket Bonus (+5) applied AFTER capturing technical feat_vec (prevents train/serve skew)
+        # Live Intermarket Bonus (+5) applied AFTER capturing technical feat_vec
         bull_final = min(100.0, bull_tech_score + (5.0 if dxy_dir < 0 else 0.0))
         bear_final = min(100.0, bear_tech_score + (5.0 if dxy_dir > 0 else 0.0))
 
         z_cap = z_thresh + 0.50
+        # Strict >95% Directional Invariant Gate (6 non-contradictory safety checks -> 100% required)
+        bull_checks = [
+            bull_mtf_ok, close > ema20, ema20 > ema50,
+            upper_wick < 0.48 and body_ratio > 0.04,
+            z_val < z_cap, dxy_dir <= 0,
+        ]
+        bear_checks = [
+            bear_mtf_ok, close < ema20, ema20 < ema50,
+            lower_wick < 0.48 and body_ratio < -0.04,
+            z_val > -z_cap, dxy_dir >= 0,
+        ]
+        bull_conf_pct = round((sum(1 for c in bull_checks if c) / len(bull_checks)) * 100.0, 1)
+        bear_conf_pct = round((sum(1 for c in bear_checks if c) / len(bear_checks)) * 100.0, 1)
+
         bull_valid = (
             bull_mtf_ok and close > ema20 and ema20 > ema50
-            and upper_wick < 0.50 and body_ratio > 0.05
+            and upper_wick < 0.48 and body_ratio > 0.04
             and z_val < z_cap and bull_final >= eff_min_score
+            and bull_conf_pct >= cfg.min_confluence_pct
         )
         bear_valid = (
             bear_mtf_ok and close < ema20 and ema20 < ema50
-            and lower_wick < 0.50 and body_ratio < -0.05
+            and lower_wick < 0.48 and body_ratio < -0.04
             and z_val > -z_cap and bear_final >= eff_min_score
+            and bear_conf_pct >= cfg.min_confluence_pct
         )
 
         if bull_valid and dxy_dir > 0:
-            return "NO_SIGNAL", round(bull_final, 1), regime, {"reason": "INTERMARKET_DXY_SURGE_VETO", "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}"}
+            return "NO_SIGNAL", round(bull_final, 1), regime, {
+                "reason": "INTERMARKET_DXY_SURGE_VETO", "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}", "confluence_pct": bull_conf_pct
+            }
         if bear_valid and dxy_dir < 0:
-            return "NO_SIGNAL", round(bear_final, 1), regime, {"reason": "INTERMARKET_DXY_DUMP_VETO", "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}"}
+            return "NO_SIGNAL", round(bear_final, 1), regime, {
+                "reason": "INTERMARKET_DXY_DUMP_VETO", "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}", "confluence_pct": bear_conf_pct
+            }
         if bull_valid and bear_valid:
-            return "NO_SIGNAL", max(bull_final, bear_final), regime, {"reason": "CONFLICTING_SIGNALS"}
+            return "NO_SIGNAL", max(bull_final, bear_final), regime, {
+                "reason": "CONFLICTING_SIGNALS", "confluence_pct": max(bull_conf_pct, bear_conf_pct)
+            }
 
         tech_score_chosen = bull_tech_score if bull_valid else bear_tech_score
         feat_vec = [
@@ -1289,15 +1390,27 @@ class QuantFeatureEngine:
         ]
 
         if bull_valid:
-            return "BUY", round(bull_final, 1), regime, {"mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}", "fvg": recent_fvg_bull, "feat": feat_vec}
+            return "BUY", round(bull_final, 1), regime, {
+                "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}",
+                "fvg": recent_fvg_bull,
+                "confluence_pct": bull_conf_pct,
+                "feat": feat_vec,
+            }
         if bear_valid:
-            return "SELL", round(bear_final, 1), regime, {"mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}", "fvg": recent_fvg_bear, "feat": feat_vec}
+            return "SELL", round(bear_final, 1), regime, {
+                "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}",
+                "fvg": recent_fvg_bear,
+                "confluence_pct": bear_conf_pct,
+                "feat": feat_vec,
+            }
 
         top_dir = "BUY" if bull_final >= bear_final else "SELL"
         top_score = round(max(bull_final, bear_final), 1)
+        top_conf = bull_conf_pct if bull_final >= bear_final else bear_conf_pct
         return "NO_SIGNAL", top_score, regime, {
-            "reason": f"CONFLUENCE_BELOW_THRESHOLD({top_dir}:{top_score}/{eff_min_score})",
+            "reason": f"STRICT_CONFLUENCE_UNMET({top_dir}:{top_score}/{eff_min_score},Conf:{top_conf:.0f}%)",
             "mtf_bias": f"H:{htf_bias:+d}/M:{mid_bias:+d}",
+            "confluence_pct": top_conf,
         }
 
     @staticmethod
@@ -1371,6 +1484,10 @@ class BacktestAndOptimizer:
                 continue
 
             entry = float(df["Close"].iloc[i])
+            bar_range = max(0.05, float(df["High"].iloc[i]) - float(df["Low"].iloc[i]))
+            vol_ratio = min(2.5, max(0.5, bar_range / (atr + 1e-8)))
+            dynamic_slippage = SLIPPAGE_USD * vol_ratio
+
             last_sl_px = float(df["last_sl"].iloc[i]) if not pd.isna(df["last_sl"].iloc[i]) else np.nan
             last_sh_px = float(df["last_sh"].iloc[i]) if not pd.isna(df["last_sh"].iloc[i]) else np.nan
             sl, tp1, tp2, tp3 = QuantFeatureEngine.compute_sl_and_tps(direction, entry, atr, last_sl_px, last_sh_px, cfg)
@@ -1378,7 +1495,7 @@ class BacktestAndOptimizer:
 
             risk_usd = equity * (DEFAULT_RISK_PCT / 100.0)
             lot = calculate_mt5_lot_size(entry, sl, equity, DEFAULT_RISK_PCT)
-            friction_rt = (spread_usd + 2.0 * SLIPPAGE_USD) * lot * CONTRACT_SIZE
+            friction_rt = (spread_usd + 2.0 * dynamic_slippage) * lot * CONTRACT_SIZE
             total_friction_usd += friction_rt
 
             cur_sl, rem_weight, realized_r = sl, 1.0, 0.0
@@ -1471,11 +1588,19 @@ class BacktestAndOptimizer:
         std_r = float(np.std(r_returns, ddof=1)) if len(r_returns) >= 3 else 0.0
         sharpe = max(-10.0, min(10.0, (expectancy_r / std_r) * math.sqrt(total_trades))) if (len(r_returns) >= 3 and std_r > 1e-3) else 0.0
 
+        split_r_diff = 0.0
+        if len(r_returns) >= 6:
+            mid_r = len(r_returns) // 2
+            wr1 = sum(1 for x in r_returns[:mid_r] if x > 0) / mid_r
+            wr2 = sum(1 for x in r_returns[mid_r:] if x > 0) / (len(r_returns) - mid_r)
+            split_r_diff = abs(wr1 - wr2)
+
         return {
             "mode": cfg.mode_name, "trades": total_trades, "wins": wins, "losses": losses,
             "win_rate": round(win_rate, 2), "tp1_hit_rate": round(tp1_hit_rate, 2),
             "profit_factor": round(min(profit_factor, 9.99), 2), "expectancy_r": round(expectancy_r, 3),
             "sharpe": round(sharpe, 2), "max_dd_pct": round(max_dd_pct, 2),
+            "split_wr_drift": round(split_r_diff, 3),
             "total_return_pct": round(((equity - account_balance) / account_balance) * 100.0, 2),
             "final_equity": round(equity, 2), "friction_usd": round(total_friction_usd, 2),
             "equity_curve": equity_curve, "feat_X": feat_X, "feat_y": feat_y,
@@ -1512,12 +1637,16 @@ class BacktestAndOptimizer:
                 )
                 if is_stats["trades"] < cfg.min_backtest_trades:
                     continue
-                obj = is_stats["expectancy_r"] * math.sqrt(is_stats["trades"]) * min(is_stats["profit_factor"], 3.0) - 0.18 * is_stats["max_dd_pct"]
+                ev = is_stats["expectancy_r"]
+                pf = min(is_stats["profit_factor"], 3.0)
+                consistency_penalty = 1.50 * is_stats.get("split_wr_drift", 0.0)
+                dd_penalty = 0.20 * is_stats["max_dd_pct"]
+                obj = (ev * math.sqrt(is_stats["trades"]) * pf) - dd_penalty - consistency_penalty
                 if obj > best_obj:
                     best_obj, best_atr, best_z, found, best_is_stats = obj, atr_p, z_t, True, is_stats
 
         if not found:
-            best_atr, best_z = 20, 1.5
+            best_atr, best_z = 14, 2.0
             best_is_stats = cls.run_backtest(cached_bt[best_atr], cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=60, end_idx=is_end)
 
         win_df = cached_bt[best_atr]
@@ -1570,7 +1699,7 @@ class BacktestAndOptimizer:
     def generate_performance_chart(scalp_stats: Dict[str, Any], swing_stats: Dict[str, Any], out_path: str = CHART_PATH) -> None:
         fig, axes = plt.subplots(2, 1, figsize=(12, 8), facecolor="#0d1117")
         fig.suptitle(
-            "APEX-QUANT-OMNI | Dual-Tier Walk-Forward Backtest (Spread + Slippage + OOS)",
+            "APEX-QUANT-OMNI | Dual-Tier Walk-Forward Backtest (Spread + Dynamic Slippage + OOS)",
             color="#f0f6fc", fontsize=12.5, fontweight="bold",
         )
         for ax, st, color, label in [
@@ -1605,7 +1734,7 @@ class BacktestAndOptimizer:
 
 
 # ==============================================================================
-# SIGNAL GENERATOR & AUTO-TRAILING STOP ENGINE
+# SIGNAL GENERATOR & CHRONOLOGICAL AUTO-TRAILING STOP ENGINE
 # ==============================================================================
 class SignalEngine:
     @staticmethod
@@ -1637,13 +1766,14 @@ class SignalEngine:
             df_enriched, idx, cfg, z_thresh=z_thresh, check_session=True, dxy_dir=int(intermarket.get("dxy_dir", 0))
         )
         mtf_bias = str(diag.get("mtf_bias", "N/A"))
+        conf_pct = float(diag.get("confluence_pct", 0.0))
 
         if direction == "NO_SIGNAL":
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
-                score=score, ker=round(ker, 2), adx=round(adx, 1), z_score=round(z_val, 2),
-                atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias, macro_ctx=macro_tag,
-                candle_ts=candle_ts, reason=str(diag.get("reason", "NO_CONFLUENCE")),
+                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts, reason=str(diag.get("reason", "NO_CONFLUENCE")),
             )
 
         oos_trades = int(backtest_stats.get("oos_trades", 0))
@@ -1651,17 +1781,17 @@ class SignalEngine:
         if oos_trades >= 6 and oos_ev_r < -0.25 and score < (cfg.min_score + 6.0):
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
-                score=score, ker=round(ker, 2), adx=round(adx, 1), z_score=round(z_val, 2),
-                atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias, macro_ctx=macro_tag,
-                candle_ts=candle_ts, reason=f"OOS_DEGRADATION_GUARD(EV={oos_ev_r:+.2f}R)",
+                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"OOS_DEGRADATION_GUARD(EV={oos_ev_r:+.2f}R)",
             )
 
         if live_mid > 100.0 and atr > 0 and abs(live_mid - close_px) > (0.65 * atr):
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(live_mid, 2),
-                score=score, ker=round(ker, 2), adx=round(adx, 1), z_score=round(z_val, 2),
-                atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias, macro_ctx=macro_tag,
-                candle_ts=candle_ts, reason=f"PRICE_DRIFT_GUARD(diff={abs(live_mid-close_px):.2f})",
+                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"PRICE_DRIFT_GUARD(diff={abs(live_mid-close_px):.2f})",
             )
 
         half_spread = live_spread_usd / 2.0
@@ -1701,30 +1831,31 @@ class SignalEngine:
         if ev_r <= 0.15:
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
-                score=score, ker=round(ker, 2), adx=round(adx, 1), z_score=round(z_val, 2),
-                atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias, macro_ctx=macro_tag,
-                candle_ts=candle_ts, reason=f"LOW_EXPECTANCY_EV={ev_r:+.2f}R",
+                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"LOW_EXPECTANCY_EV={ev_r:+.2f}R",
             )
 
         tier = "SNIPER" if (is_sniper_setup and p_win >= 60.0) else "PRO"
         return SignalCandidate(
             mode=cfg.mode_name, direction=direction, tier=tier, entry=entry, sl=sl,
             tp1=tp1, tp2=tp2, tp3=tp3, lot_size=lot_size, risk_usd=risk_usd,
-            score=score, p_win=p_win, ev_r=ev_r, ker=round(ker, 2), adx=round(adx, 1),
-            z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
-            macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"SIGNAL_{tier}_CONFIRMED", pillar_details=diag,
+            score=score, confluence_pct=conf_pct, p_win=p_win, ev_r=ev_r,
+            ker=round(ker, 2), adx=round(adx, 1), z_score=round(z_val, 2), atr=round(atr, 2),
+            regime=regime, mtf_bias=mtf_bias, macro_ctx=macro_tag, candle_ts=candle_ts,
+            reason=f"SIGNAL_{tier}_CONFIRMED", pillar_details=diag,
         )
 
     @staticmethod
     def format_telegram_signal(sig: SignalCandidate) -> str:
-        badge = "💎 SNIPER A+" if sig.tier == "SNIPER" else "⚡ PRO"
+        badge = "💎 SNIPER" if sig.tier == "SNIPER" else "⚡"
         return (
-            f"{badge} | <b>XAUUSD | {sig.mode} | {sig.direction}</b>\n"
+            f"{badge} <b>XAUUSD | {sig.mode} | {sig.direction}</b>\n"
             f"🎯 Entry: <code>{sig.entry:.2f}</code> | 🛑 SL: <code>{sig.sl:.2f}</code>\n"
             f"✅ TP1: <code>{sig.tp1:.2f}</code> | TP2: <code>{sig.tp2:.2f}</code> | TP3: <code>{sig.tp3:.2f}</code>\n"
-            f"📐 Lot: <code>{sig.lot_size:.2f}</code> (<code>${sig.risk_usd:.0f}</code>) | Skor: <code>{sig.score:.0f}/100</code> | Regime: <code>{sig.regime}</code>\n"
-            f"🔄 Trail: BE @ TP1 (+News Shield) | 🕒 <code>{utc_now().strftime('%H:%M UTC')}</code>\n"
-            f"🧠 Edge: P(Win) <code>{sig.p_win:.0f}%</code> | EV <code>{sig.ev_r:+.2f}R</code> | KER <code>{sig.ker:.2f}</code> | <code>{sig.macro_ctx}</code>"
+            f"📐 Lot: <code>{sig.lot_size:.2f}</code> | Skor: <code>{sig.score:.0f}/100</code> | Regime: <code>{sig.regime}</code>\n"
+            f"🔄 Trail: Aktif @ TP1 (BE) | 🕒 <code>{utc_now().strftime('%H:%M UTC')}</code>\n"
+            f"🧠 Edge: Konfluensi <code>{sig.confluence_pct:.0f}%</code> | P(Win) <code>{sig.p_win:.0f}%</code> | EV <code>{sig.ev_r:+.2f}R</code> | KER <code>{sig.ker:.2f}</code> | <code>{sig.macro_ctx}</code>"
         )
 
 
@@ -1749,80 +1880,80 @@ class TrailingStopManager:
             if df_ref.empty:
                 df_ref = df_5m
 
-            since_df = df_ref[df_ref.index >= datetime.fromisoformat(tr["created_at"])]
-            high_since = max(float(since_df["High"].max()), latest_price) if not since_df.empty else latest_price
-            low_since = min(float(since_df["Low"].min()), latest_price) if not since_df.empty else latest_price
+            try:
+                sig_candle_dt = datetime.fromisoformat(tr["candle_ts"])
+                since_df = df_ref[df_ref.index > sig_candle_dt]
+            except Exception:
+                since_df = df_ref[df_ref.index >= datetime.fromisoformat(tr["created_at"])]
 
             cur_sl, entry, init_sl = float(tr["current_sl"]), float(tr["entry"]), float(tr["initial_sl"])
             tp1, tp2, tp3, atr = float(tr["tp1"]), float(tr["tp2"]), float(tr["tp3"]), float(tr["atr"])
             sl_dist = abs(entry - init_sl)
+            new_sl, new_status = cur_sl, status
+            closed_state: Optional[str] = None
+            closed_px = cur_sl
 
-            if direction == "BUY":
-                if low_since <= cur_sl:
-                    cs = "CLOSED_BE" if cur_sl >= entry else "CLOSED_SL"
-                    self.state.update_signal_trail(sig_id, cur_sl, cs)
-                    msg = f"🛑 <b>XAUUSD | {mode} BUY #{sig_id} {cs}</b> @ <code>{cur_sl:.2f}</code> (Spot: <code>{latest_price:.2f}</code>)"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
-                    continue
-                if high_since >= tp3:
-                    self.state.update_signal_trail(sig_id, tp2, "CLOSED_TP3")
-                    msg = f"🏆 <b>XAUUSD | {mode} BUY #{sig_id} FULL TP3 HIT</b> @ <code>{tp3:.2f}</code>!"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
-                    continue
+            # Walk chronologically bar-by-bar + current live spot tick
+            bars: List[Tuple[float, float, float]] = [
+                (float(r["High"]), float(r["Low"]), float(r["Close"])) for _, r in since_df.iterrows()
+            ]
+            bars.append((latest_price, latest_price, latest_price))
 
-                new_sl, new_status = cur_sl, status
-                if high_since >= tp2 and status != "TP2_TRAIL":
-                    new_status = "TP2_TRAIL"
-                    new_sl = max(cur_sl, tp1, latest_price - atr * cfg.trail_atr_mult)
-                elif high_since >= tp1 and status in ("OPEN", "BE_LOCKED"):
-                    new_status = "TP1_TRAIL"
-                    new_sl = max(cur_sl, entry + cfg.be_buffer_usd)
-                elif news_active and latest_price >= (entry + 0.50 * sl_dist) and status == "OPEN":
-                    new_status = "BE_LOCKED"
-                    new_sl = max(cur_sl, entry + cfg.be_buffer_usd)
-                elif status == "TP2_TRAIL" or (mode == "SWING" and status == "TP1_TRAIL"):
-                    new_sl = max(cur_sl, latest_price - atr * cfg.trail_atr_mult)
+            for bar_h, bar_l, bar_c in bars:
+                if direction == "BUY":
+                    if bar_l <= new_sl:
+                        closed_state = "CLOSED_BE" if new_sl >= entry else "CLOSED_SL"
+                        closed_px = new_sl
+                        break
+                    if bar_h >= tp3:
+                        closed_state = "CLOSED_TP3"
+                        closed_px = tp3
+                        new_sl = tp2
+                        break
+                    if bar_h >= tp2 and new_status != "TP2_TRAIL":
+                        new_status = "TP2_TRAIL"
+                        new_sl = max(new_sl, tp1, bar_c - atr * cfg.trail_atr_mult)
+                    elif bar_h >= tp1 and new_status in ("OPEN", "BE_LOCKED"):
+                        new_status = "TP1_TRAIL"
+                        new_sl = max(new_sl, entry + cfg.be_buffer_usd)
+                    elif news_active and bar_c >= (entry + 0.50 * sl_dist) and new_status == "OPEN":
+                        new_status = "BE_LOCKED"
+                        new_sl = max(new_sl, entry + cfg.be_buffer_usd)
+                    if new_status == "TP2_TRAIL" or (mode == "SWING" and new_status == "TP1_TRAIL"):
+                        new_sl = max(new_sl, bar_c - atr * cfg.trail_atr_mult)
+                else:
+                    if bar_h >= new_sl:
+                        closed_state = "CLOSED_BE" if new_sl <= entry else "CLOSED_SL"
+                        closed_px = new_sl
+                        break
+                    if bar_l <= tp3:
+                        closed_state = "CLOSED_TP3"
+                        closed_px = tp3
+                        new_sl = tp2
+                        break
+                    if bar_l <= tp2 and new_status != "TP2_TRAIL":
+                        new_status = "TP2_TRAIL"
+                        new_sl = min(new_sl, tp1, bar_c + atr * cfg.trail_atr_mult)
+                    elif bar_l <= tp1 and new_status in ("OPEN", "BE_LOCKED"):
+                        new_status = "TP1_TRAIL"
+                        new_sl = min(new_sl, entry - cfg.be_buffer_usd)
+                    elif news_active and bar_c <= (entry - 0.50 * sl_dist) and new_status == "OPEN":
+                        new_status = "BE_LOCKED"
+                        new_sl = min(new_sl, entry - cfg.be_buffer_usd)
+                    if new_status == "TP2_TRAIL" or (mode == "SWING" and new_status == "TP1_TRAIL"):
+                        new_sl = min(new_sl, bar_c + atr * cfg.trail_atr_mult)
 
-                if new_status != status or new_sl > cur_sl + 0.15:
-                    self.state.update_signal_trail(sig_id, new_sl, new_status)
-                    msg = f"🔄 <b>TRAIL | {mode} BUY #{sig_id}</b> Status: <code>{new_status}</code> | SL: <code>{new_sl:.2f}</code> | Spot: <code>{latest_price:.2f}</code>"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
-            else:
-                if high_since >= cur_sl:
-                    cs = "CLOSED_BE" if cur_sl <= entry else "CLOSED_SL"
-                    self.state.update_signal_trail(sig_id, cur_sl, cs)
-                    msg = f"🛑 <b>XAUUSD | {mode} SELL #{sig_id} {cs}</b> @ <code>{cur_sl:.2f}</code> (Spot: <code>{latest_price:.2f}</code>)"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
-                    continue
-                if low_since <= tp3:
-                    self.state.update_signal_trail(sig_id, tp2, "CLOSED_TP3")
-                    msg = f"🏆 <b>XAUUSD | {mode} SELL #{sig_id} FULL TP3 HIT</b> @ <code>{tp3:.2f}</code>!"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
-                    continue
-
-                new_sl, new_status = cur_sl, status
-                if low_since <= tp2 and status != "TP2_TRAIL":
-                    new_status = "TP2_TRAIL"
-                    new_sl = min(cur_sl, tp1, latest_price + atr * cfg.trail_atr_mult)
-                elif low_since <= tp1 and status in ("OPEN", "BE_LOCKED"):
-                    new_status = "TP1_TRAIL"
-                    new_sl = min(cur_sl, entry - cfg.be_buffer_usd)
-                elif news_active and latest_price <= (entry - 0.50 * sl_dist) and status == "OPEN":
-                    new_status = "BE_LOCKED"
-                    new_sl = min(cur_sl, entry - cfg.be_buffer_usd)
-                elif status == "TP2_TRAIL" or (mode == "SWING" and status == "TP1_TRAIL"):
-                    new_sl = min(cur_sl, latest_price + atr * cfg.trail_atr_mult)
-
-                if new_status != status or new_sl < cur_sl - 0.15:
-                    self.state.update_signal_trail(sig_id, new_sl, new_status)
-                    msg = f"🔄 <b>TRAIL | {mode} SELL #{sig_id}</b> Status: <code>{new_status}</code> | SL: <code>{new_sl:.2f}</code> | Spot: <code>{latest_price:.2f}</code>"
-                    events.append(msg)
-                    self.notifier.broadcast(msg)
+            if closed_state is not None:
+                self.state.update_signal_trail(sig_id, new_sl, closed_state)
+                emoji = "🏆" if closed_state == "CLOSED_TP3" else "🛑"
+                msg = f"{emoji} <b>XAUUSD | {mode} {direction} #{sig_id} {closed_state}</b> @ <code>{closed_px:.2f}</code> (Spot: <code>{latest_price:.2f}</code>)"
+                events.append(msg)
+                self.notifier.broadcast(msg)
+            elif new_status != status or abs(new_sl - cur_sl) > 0.15:
+                self.state.update_signal_trail(sig_id, new_sl, new_status)
+                msg = f"🔄 <b>TRAIL | {mode} {direction} #{sig_id}</b> Status: <code>{new_status}</code> | SL: <code>{new_sl:.2f}</code> | Spot: <code>{latest_price:.2f}</code>"
+                events.append(msg)
+                self.notifier.broadcast(msg)
         return events
 
 
@@ -1836,7 +1967,7 @@ def forensic_audit_log(
 ) -> None:
     lines = [
         "=" * 88,
-        "APEX-QUANT-OMNI — HYPERION DUAL-TIER PRECISION FORENSIC AUDIT LOG",
+        "APEX-QUANT-OMNI — HYPERION APEX FORENSIC AUDIT LOG",
         "=" * 88,
         f"Timestamp UTC     : {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')} | TierFilter={SIGNAL_TIER_MODE}",
         f"Data Feeds        : {json.dumps(sources)}",
@@ -1850,7 +1981,7 @@ def forensic_audit_log(
             f"MaxDD={scalp_stats.get('max_dd_pct')}% | Ret={scalp_stats.get('total_return_pct'):+.2f}%"
         ),
         (
-            f"[SCALP SNIPER 86+]: Trades={scalp_stats.get('sniper_trades')} | WR={scalp_stats.get('sniper_wr')}% | "
+            f"[SCALP SNIPER]    : Trades={scalp_stats.get('sniper_trades')} | WR={scalp_stats.get('sniper_wr')}% | "
             f"TP1Hit={scalp_stats.get('sniper_tp1_hit')}% | PF={scalp_stats.get('sniper_pf')} | "
             f"OOS={scalp_stats.get('sniper_oos_wr')}%/{scalp_stats.get('sniper_oos_trades')}T | MaxDD={scalp_stats.get('sniper_dd')}% | Ret={scalp_stats.get('sniper_ret'):+.2f}%"
         ),
@@ -1861,13 +1992,13 @@ def forensic_audit_log(
             f"MaxDD={swing_stats.get('max_dd_pct')}% | Ret={swing_stats.get('total_return_pct'):+.2f}%"
         ),
         (
-            f"[SWING SNIPER 86+]: Trades={swing_stats.get('sniper_trades')} | WR={swing_stats.get('sniper_wr')}% | "
+            f"[SWING SNIPER]    : Trades={swing_stats.get('sniper_trades')} | WR={swing_stats.get('sniper_wr')}% | "
             f"TP1Hit={swing_stats.get('sniper_tp1_hit')}% | PF={swing_stats.get('sniper_pf')} | "
             f"OOS={swing_stats.get('sniper_oos_wr')}%/{swing_stats.get('sniper_oos_trades')}T | MaxDD={swing_stats.get('sniper_dd')}% | Ret={swing_stats.get('sniper_ret'):+.2f}%"
         ),
         "-" * 88,
-        f"[LIVE SCALP]      : {scalp_sig.direction} ({scalp_sig.tier}) | Px={scalp_sig.entry} | Score={scalp_sig.score} | Regime={scalp_sig.regime} | KER={scalp_sig.ker} | ADX={scalp_sig.adx} | Reason={scalp_sig.reason}",
-        f"[LIVE SWING]      : {swing_sig.direction} ({swing_sig.tier}) | Px={swing_sig.entry} | Score={swing_sig.score} | Regime={swing_sig.regime} | KER={swing_sig.ker} | ADX={swing_sig.adx} | Reason={swing_sig.reason}",
+        f"[LIVE SCALP]      : {scalp_sig.direction} ({scalp_sig.tier}) | Px={scalp_sig.entry} | Score={scalp_sig.score} | Conf={scalp_sig.confluence_pct}% | Regime={scalp_sig.regime} | KER={scalp_sig.ker} | ADX={scalp_sig.adx} | Reason={scalp_sig.reason}",
+        f"[LIVE SWING]      : {swing_sig.direction} ({swing_sig.tier}) | Px={swing_sig.entry} | Score={swing_sig.score} | Conf={swing_sig.confluence_pct}% | Regime={swing_sig.regime} | KER={swing_sig.ker} | ADX={swing_sig.adx} | Reason={swing_sig.reason}",
         f"[ACTIVE TRADES]   : {len(active_trades)} active position(s)",
     ]
     for t in active_trades:
@@ -1881,7 +2012,7 @@ def format_on_demand_check(sig: SignalCandidate, bt_stats: Dict[str, Any]) -> st
         return SignalEngine.format_telegram_signal(sig)
     return (
         f"⏸ <b>XAUUSD | {sig.mode} | NO_SIGNAL</b>\n"
-        f"💵 Spot: <code>{sig.entry:.2f}</code> | Skor: <code>{sig.score:.0f}</code> | Regime: <code>{sig.regime}</code>\n"
+        f"💵 Spot: <code>{sig.entry:.2f}</code> | Skor: <code>{sig.score:.0f}</code> | Konf: <code>{sig.confluence_pct:.0f}%</code> | Regime: <code>{sig.regime}</code>\n"
         f"🛡 Filter: <code>{sig.reason}</code> | TP1Hit: <code>{bt_stats.get('tp1_hit_rate', 0):.1f}%</code>"
     )
 
@@ -1968,7 +2099,7 @@ def main() -> int:
         live_spread = float(live_quote.get("spread", SPREAD_USD) or SPREAD_USD)
         live_mid = float(live_quote.get("mid", 0.0) or 0.0)
 
-        tf_bundle = data_engine.load_all_timeframes()
+        tf_bundle = data_engine.load_all_timeframes(spot_ref=live_mid)
         df_5m, src_5m = tf_bundle["5m"]
         df_15m, src_15m = tf_bundle["15m"]
         df_1h, src_1h = tf_bundle["1h"]
@@ -2038,7 +2169,7 @@ def main() -> int:
         for chat_id, raw_cmd in pending_cmds:
             cmd = raw_cmd.lower().strip()
             target_cid = chat_id if chat_id else None
-            if cmd.startswith("/status"):
+            if cmd.startswith("/status") or (cmd.startswith("/check") and "status" in cmd):
                 notifier.broadcast(
                     format_status_message(state, spot_px, scalp_stats, swing_stats, intermarket, news_info),
                     target_chat_id=target_cid,
@@ -2055,14 +2186,15 @@ def main() -> int:
             elif cmd.startswith("/sniper"):
                 s_msg = (
                     f"💎 <b>SNIPER MODE SNAPSHOT</b> (<code>{intermarket.get('tag')}</code>)\n"
-                    f"• SCALP: <code>{scalp_sig.direction} ({scalp_sig.tier})</code> Skor <code>{scalp_sig.score:.0f}/86</code> | {scalp_sig.reason}\n"
-                    f"• SWING: <code>{swing_sig.direction} ({swing_sig.tier})</code> Skor <code>{swing_sig.score:.0f}/86</code> | {swing_sig.reason}"
+                    f"• SCALP: <code>{scalp_sig.direction} ({scalp_sig.tier})</code> Skor <code>{scalp_sig.score:.0f}/{SCALP_CONFIG.sniper_score:.0f}</code> | {scalp_sig.reason}\n"
+                    f"• SWING: <code>{swing_sig.direction} ({swing_sig.tier})</code> Skor <code>{swing_sig.score:.0f}/{SWING_CONFIG.sniper_score:.0f}</code> | {swing_sig.reason}"
                 )
                 notifier.broadcast(s_msg, target_chat_id=target_cid)
             elif cmd.startswith("/help"):
                 notifier.broadcast(
                     "🤖 <b>APEX-QUANT COMMANDS</b>\n"
                     "<code>/check</code> — Analisa SCALP & SWING\n"
+                    "<code>/check scalp</code> / <code>/check swing</code> — Analisa Mode Spesifik\n"
                     "<code>/sniper</code> — Cek Peluang Sniper A+\n"
                     "<code>/status</code> — Status Posisi, DXY & News\n"
                     "<code>/chart</code> — Grafik Dual-Tier OOS\n"
