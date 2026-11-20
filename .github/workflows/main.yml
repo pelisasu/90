@@ -2,37 +2,39 @@ name: APEX-QUANT-OMNI XAUUSD Signal Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  repository_dispatch:
-    types: [telegram_check]
+    # Run every 5 minutes Monday-Friday (active XAUUSD trading week)
+    - cron: "*/5 * * * 1-5"
+    # Also run Sunday evening UTC for market open & active trade management
+    - cron: "*/15 21-23 * * 0"
   workflow_dispatch:
     inputs:
       command:
-        description: "Mode eksekusi manual"
+        description: "Bot execution mode (auto, check, scalp, swing, status, sniper, chart, history)"
         required: false
         default: "auto"
         type: choice
         options:
           - auto
           - check
-          - sniper
           - scalp
           - swing
           - status
+          - sniper
           - chart
           - history
       tier_mode:
-        description: "Filter Tier Sinyal (BOTH = Pro + Sniper | SNIPER_ONLY = A+ Saja)"
+        description: "Signal tier filter"
         required: false
         default: "BOTH"
         type: choice
         options:
           - BOTH
-          - SNIPER_ONLY
           - PRO_ONLY
+          - SNIPER_ONLY
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: apex-quant-omni-xauusd
@@ -41,34 +43,38 @@ concurrency:
 jobs:
   run-signal-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite State & Persistence Cache
-        uses: actions/cache@v4
+      - name: Restore persistent SQLite state & chart cache
+        uses: actions/cache/restore@v4
+        id: state-cache
         with:
-          path: trading_signals.db
+          path: |
+            trading_signals.db
+            trading_signals.db-wal
+            trading_signals.db-shm
+            backtest_performance.png
           key: apex-quant-state-${{ github.run_id }}
           restore-keys: |
             apex-quant-state-
 
-      - name: Execute APEX-QUANT-OMNI Engine
+      - name: Run APEX-QUANT-OMNI XAUUSD Engine
         env:
-          PYTHONUNBUFFERED: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -76,12 +82,25 @@ jobs:
           RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT || '1.0' }}
           SPREAD_USD: ${{ vars.SPREAD_USD || '0.30' }}
           SLIPPAGE_USD: ${{ vars.SLIPPAGE_USD || '0.10' }}
-          SIGNAL_TIER_MODE: ${{ github.event.inputs.tier_mode || vars.SIGNAL_TIER_MODE || 'BOTH' }}
-          BOT_COMMAND: ${{ github.event.inputs.command || github.event.client_payload.command || 'auto' }}
+          SIGNAL_TIER_MODE: ${{ inputs.tier_mode || vars.SIGNAL_TIER_MODE || 'BOTH' }}
+          BOT_COMMAND: ${{ inputs.command || 'auto' }}
+          DB_PATH: "trading_signals.db"
+          CHART_PATH: "backtest_performance.png"
         run: |
           python -u bot.py
 
-      - name: Upload State DB & Backtest Performance Artifact
+      - name: Save persistent SQLite state to GitHub cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_signals.db
+            trading_signals.db-wal
+            trading_signals.db-shm
+            backtest_performance.png
+          key: apex-quant-state-${{ github.run_id }}
+
+      - name: Upload State & Backtest Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -90,3 +109,4 @@ jobs:
             trading_signals.db
             backtest_performance.png
           retention-days: 14
+          if-no-files-found: warn
