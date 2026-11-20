@@ -113,8 +113,11 @@ class ModeConfig:
     sniper_score: float
     min_confluence_pct: float
     min_ker: float
+    min_ker_floor: float
     max_chop: float
     min_adx: float
+    min_ema_sep_atr: float
+    sniper_min_ker: float
     cooldown_minutes: int
     min_backtest_trades: int
     z_window: int
@@ -139,8 +142,11 @@ SCALP_CONFIG = ModeConfig(
     sniper_score=86.0,
     min_confluence_pct=95.0,
     min_ker=0.33,
+    min_ker_floor=0.24,
     max_chop=56.0,
     min_adx=19.0,
+    min_ema_sep_atr=0.0,
+    sniper_min_ker=0.30,
     cooldown_minutes=30,
     min_backtest_trades=8,
     z_window=20,
@@ -157,16 +163,19 @@ SWING_CONFIG = ModeConfig(
     exec_tf="15m",
     mid_tf="1h",
     htf_tf="4h",
-    sl_atr_mult=1.85,
+    sl_atr_mult=1.90,
     tp_r_multiples=(1.50, 2.50, 4.00),
     tp1_close_pct=0.50,
     trail_atr_mult=0.80,
-    min_score=75.0,
+    min_score=78.0,
     sniper_score=86.0,
     min_confluence_pct=95.0,
-    min_ker=0.34,
-    max_chop=56.0,
+    min_ker=0.35,
+    min_ker_floor=0.0,
+    max_chop=54.0,
     min_adx=20.0,
+    min_ema_sep_atr=0.35,
+    sniper_min_ker=0.0,
     cooldown_minutes=120,
     min_backtest_trades=5,
     z_window=24,
@@ -1210,6 +1219,8 @@ class QuantFeatureEngine:
             eff_adx = max(cfg.min_adx, 23.0)
             eff_score = max(cfg.min_score, 84.0)
 
+        if cfg.min_ker_floor > 0.0 and ker < cfg.min_ker_floor:
+            return "CHOPPY_NOISE", False, eff_score
         if chop > cfg.max_chop and ker < eff_ker:
             return "CHOPPY_SIDEWAYS", False, eff_score
         if adx < eff_adx and ker < eff_ker:
@@ -1240,7 +1251,7 @@ class QuantFeatureEngine:
         if not tradeable:
             return "NO_SIGNAL", 0.0, regime, {"reason": f"REGIME_BLOCK:{regime}", "confluence_pct": 0.0}
 
-        close, ema20, ema50 = float(row["Close"]), float(row["ema20"]), float(row["ema50"])
+        close, ema20, ema50, atr = float(row["Close"]), float(row["ema20"]), float(row["ema50"]), float(row["atr"])
         z_val = float(row["z_score"])
         z_prev = float(row["z_prev"]) if not pd.isna(row["z_prev"]) else z_val
         of_score, body_ratio = float(row["of_score"]), float(row["body_ratio"])
@@ -1340,30 +1351,32 @@ class QuantFeatureEngine:
         bear_final = min(100.0, bear_tech_score + (5.0 if dxy_dir > 0 else 0.0))
 
         z_cap = z_thresh + 0.50
-        # Strict >95% Directional Invariant Gate (6 non-contradictory safety checks -> 100% required)
+        ema_sep_atr = abs(ema20 - ema50) / (atr + 1e-8)
+        ema_sep_ok = (cfg.min_ema_sep_atr <= 0.0) or (ema_sep_atr >= cfg.min_ema_sep_atr)
+        # Strict >95% Directional Invariant Gate (7 non-contradictory safety checks -> 100% required)
         bull_checks = [
-            bull_mtf_ok, close > ema20, ema20 > ema50,
+            bull_mtf_ok, close > ema20, ema20 > ema50, ema_sep_ok,
             upper_wick < 0.48 and body_ratio > 0.04,
-            z_val < z_cap, dxy_dir <= 0,
+            bull_z_ok and z_val < z_cap, dxy_dir <= 0,
         ]
         bear_checks = [
-            bear_mtf_ok, close < ema20, ema20 < ema50,
+            bear_mtf_ok, close < ema20, ema20 < ema50, ema_sep_ok,
             lower_wick < 0.48 and body_ratio < -0.04,
-            z_val > -z_cap, dxy_dir >= 0,
+            bear_z_ok and z_val > -z_cap, dxy_dir >= 0,
         ]
         bull_conf_pct = round((sum(1 for c in bull_checks if c) / len(bull_checks)) * 100.0, 1)
         bear_conf_pct = round((sum(1 for c in bear_checks if c) / len(bear_checks)) * 100.0, 1)
 
         bull_valid = (
-            bull_mtf_ok and close > ema20 and ema20 > ema50
+            bull_mtf_ok and close > ema20 and ema20 > ema50 and ema_sep_ok
             and upper_wick < 0.48 and body_ratio > 0.04
-            and z_val < z_cap and bull_final >= eff_min_score
+            and bull_z_ok and z_val < z_cap and bull_final >= eff_min_score
             and bull_conf_pct >= cfg.min_confluence_pct
         )
         bear_valid = (
-            bear_mtf_ok and close < ema20 and ema20 < ema50
+            bear_mtf_ok and close < ema20 and ema20 < ema50 and ema_sep_ok
             and lower_wick < 0.48 and body_ratio < -0.04
-            and z_val > -z_cap and bear_final >= eff_min_score
+            and bear_z_ok and z_val > -z_cap and bear_final >= eff_min_score
             and bear_conf_pct >= cfg.min_confluence_pct
         )
 
@@ -1451,7 +1464,8 @@ class BacktestAndOptimizer:
     def run_backtest(
         df: pd.DataFrame, cfg: ModeConfig, z_thresh: float,
         spread_usd: float = SPREAD_USD, account_balance: float = DEFAULT_ACCOUNT_BALANCE,
-        start_idx: int = 60, end_idx: Optional[int] = None, min_score_override: Optional[float] = None,
+        start_idx: int = 60, end_idx: Optional[int] = None,
+        min_score_override: Optional[float] = None, min_ker_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         n = min(len(df), end_idx) if end_idx is not None else len(df)
         start_i = max(60, start_idx)
@@ -1474,7 +1488,12 @@ class BacktestAndOptimizer:
                 continue
 
             direction, score, _, diag = QuantFeatureEngine.evaluate_bar(df, i, cfg, z_thresh=z_thresh, check_session=True)
-            if direction not in ("BUY", "SELL") or (min_score_override is not None and score < min_score_override):
+            row_ker = float(df["ker"].iloc[i])
+            if (
+                direction not in ("BUY", "SELL")
+                or (min_score_override is not None and score < min_score_override)
+                or (min_ker_override is not None and row_ker < min_ker_override)
+            ):
                 i += 1
                 continue
 
@@ -1629,6 +1648,7 @@ class BacktestAndOptimizer:
         best_obj, best_atr, best_z, found = -1e9, 14, 2.0, False
         best_is_stats: Optional[Dict[str, Any]] = None
         is_end = split_idx if has_oos else n_bt
+        candidates: List[Tuple[int, float, float, Dict[str, Any]]] = []
 
         for atr_p in GRID_ATR_PERIODS:
             for z_t in GRID_Z_THRESHOLDS:
@@ -1642,8 +1662,13 @@ class BacktestAndOptimizer:
                 consistency_penalty = 1.50 * is_stats.get("split_wr_drift", 0.0)
                 dd_penalty = 0.20 * is_stats["max_dd_pct"]
                 obj = (ev * math.sqrt(is_stats["trades"]) * pf) - dd_penalty - consistency_penalty
-                if obj > best_obj:
-                    best_obj, best_atr, best_z, found, best_is_stats = obj, atr_p, z_t, True, is_stats
+                candidates.append((atr_p, z_t, obj, is_stats))
+
+        pos_pf_pool = [c for c in candidates if c[3]["profit_factor"] >= 1.0]
+        pool = pos_pf_pool if pos_pf_pool else candidates
+        for atr_p, z_t, obj, is_stats in pool:
+            if obj > best_obj:
+                best_obj, best_atr, best_z, found, best_is_stats = obj, atr_p, z_t, True, is_stats
 
         if not found:
             best_atr, best_z = 14, 2.0
@@ -1656,13 +1681,15 @@ class BacktestAndOptimizer:
 
         full_stats = cls.run_backtest(win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=60)
         sniper_stats = cls.run_backtest(
-            win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=60, min_score_override=cfg.sniper_score
+            win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=60,
+            min_score_override=cfg.sniper_score, min_ker_override=cfg.sniper_min_ker,
         )
 
         if has_oos:
             oos_stats = cls.run_backtest(win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=split_idx)
             sniper_oos = cls.run_backtest(
-                win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=split_idx, min_score_override=cfg.sniper_score
+                win_df, cfg, z_thresh=best_z, spread_usd=spread_usd, start_idx=split_idx,
+                min_score_override=cfg.sniper_score, min_ker_override=cfg.sniper_min_ker,
             )
             full_stats["oos_split_ts"] = win_df.index[split_idx]
             full_stats["oos_trades"] = oos_stats["trades"]
@@ -1804,7 +1831,7 @@ class SignalEngine:
         lot_size = calculate_mt5_lot_size(entry, sl, DEFAULT_ACCOUNT_BALANCE, DEFAULT_RISK_PCT)
         risk_usd = round(abs(entry - sl) * lot_size * CONTRACT_SIZE, 2)
 
-        is_sniper_setup = (score >= cfg.sniper_score and ker >= 0.38)
+        is_sniper_setup = (score >= cfg.sniper_score and ker >= cfg.sniper_min_ker)
         s_oos_n = int(backtest_stats.get("sniper_oos_trades", 0))
         if is_sniper_setup and s_oos_n >= 4:
             ref_wr = float(backtest_stats.get("sniper_oos_wr", backtest_stats.get("sniper_wr", 55.0))) / 100.0
