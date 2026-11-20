@@ -118,6 +118,11 @@ class ModeConfig:
     min_adx: float
     min_ema_sep_atr: float
     sniper_min_ker: float
+    max_vwap_dist_atr: float
+    max_adverse_wick: float
+    max_spread_usd: float
+    min_p_win: float
+    min_ev_r: float
     cooldown_minutes: int
     min_backtest_trades: int
     z_window: int
@@ -147,6 +152,11 @@ SCALP_CONFIG = ModeConfig(
     min_adx=19.0,
     min_ema_sep_atr=0.0,
     sniper_min_ker=0.30,
+    max_vwap_dist_atr=2.40,
+    max_adverse_wick=0.42,
+    max_spread_usd=0.55,
+    min_p_win=58.0,
+    min_ev_r=0.25,
     cooldown_minutes=30,
     min_backtest_trades=8,
     z_window=20,
@@ -167,7 +177,7 @@ SWING_CONFIG = ModeConfig(
     tp_r_multiples=(1.50, 2.50, 4.00),
     tp1_close_pct=0.50,
     trail_atr_mult=0.80,
-    min_score=78.0,
+    min_score=80.0,
     sniper_score=86.0,
     min_confluence_pct=95.0,
     min_ker=0.35,
@@ -176,6 +186,11 @@ SWING_CONFIG = ModeConfig(
     min_adx=20.0,
     min_ema_sep_atr=0.35,
     sniper_min_ker=0.0,
+    max_vwap_dist_atr=2.40,
+    max_adverse_wick=0.40,
+    max_spread_usd=0.75,
+    min_p_win=56.0,
+    min_ev_r=0.30,
     cooldown_minutes=120,
     min_backtest_trades=5,
     z_window=24,
@@ -1353,31 +1368,33 @@ class QuantFeatureEngine:
         z_cap = z_thresh + 0.50
         ema_sep_atr = abs(ema20 - ema50) / (atr + 1e-8)
         ema_sep_ok = (cfg.min_ema_sep_atr <= 0.0) or (ema_sep_atr >= cfg.min_ema_sep_atr)
-        # Strict >95% Directional Invariant Gate (7 non-contradictory safety checks -> 100% required)
+        bull_vwap_ok = vwap_dist <= cfg.max_vwap_dist_atr
+        bear_vwap_ok = vwap_dist >= -cfg.max_vwap_dist_atr
+        # Strict >95% Directional Invariant Gate (8 non-contradictory safety checks -> 100% required)
         bull_checks = [
             bull_mtf_ok, close > ema20, ema20 > ema50, ema_sep_ok,
-            upper_wick < 0.48 and body_ratio > 0.04,
-            bull_z_ok and z_val < z_cap, dxy_dir <= 0,
+            upper_wick < cfg.max_adverse_wick and body_ratio > 0.04,
+            bull_z_ok and z_val < z_cap, bull_vwap_ok, dxy_dir <= 0,
         ]
         bear_checks = [
             bear_mtf_ok, close < ema20, ema20 < ema50, ema_sep_ok,
-            lower_wick < 0.48 and body_ratio < -0.04,
-            bear_z_ok and z_val > -z_cap, dxy_dir >= 0,
+            lower_wick < cfg.max_adverse_wick and body_ratio < -0.04,
+            bear_z_ok and z_val > -z_cap, bear_vwap_ok, dxy_dir >= 0,
         ]
         bull_conf_pct = round((sum(1 for c in bull_checks if c) / len(bull_checks)) * 100.0, 1)
         bear_conf_pct = round((sum(1 for c in bear_checks if c) / len(bear_checks)) * 100.0, 1)
 
         bull_valid = (
             bull_mtf_ok and close > ema20 and ema20 > ema50 and ema_sep_ok
-            and upper_wick < 0.48 and body_ratio > 0.04
-            and bull_z_ok and z_val < z_cap and bull_final >= eff_min_score
-            and bull_conf_pct >= cfg.min_confluence_pct
+            and upper_wick < cfg.max_adverse_wick and body_ratio > 0.04
+            and bull_z_ok and z_val < z_cap and bull_vwap_ok
+            and bull_final >= eff_min_score and bull_conf_pct >= cfg.min_confluence_pct
         )
         bear_valid = (
             bear_mtf_ok and close < ema20 and ema20 < ema50 and ema_sep_ok
-            and lower_wick < 0.48 and body_ratio < -0.04
-            and bear_z_ok and z_val > -z_cap and bear_final >= eff_min_score
-            and bear_conf_pct >= cfg.min_confluence_pct
+            and lower_wick < cfg.max_adverse_wick and body_ratio < -0.04
+            and bear_z_ok and z_val > -z_cap and bear_vwap_ok
+            and bear_final >= eff_min_score and bear_conf_pct >= cfg.min_confluence_pct
         )
 
         if bull_valid and dxy_dir > 0:
@@ -1803,9 +1820,18 @@ class SignalEngine:
                 macro_ctx=macro_tag, candle_ts=candle_ts, reason=str(diag.get("reason", "NO_CONFLUENCE")),
             )
 
+        if live_spread_usd > cfg.max_spread_usd:
+            return SignalCandidate(
+                mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
+                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime="SPREAD_GUARD", mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts,
+                reason=f"SPREAD_SHOCK_GUARD({live_spread_usd:.2f}>{cfg.max_spread_usd:.2f})",
+            )
+
         oos_trades = int(backtest_stats.get("oos_trades", 0))
         oos_ev_r = float(backtest_stats.get("oos_ev_r", 0.0))
-        if oos_trades >= 6 and oos_ev_r < -0.25 and score < (cfg.min_score + 6.0):
+        if oos_trades >= 6 and oos_ev_r < -0.05 and score < cfg.sniper_score:
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
                 score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
@@ -1813,7 +1839,7 @@ class SignalEngine:
                 macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"OOS_DEGRADATION_GUARD(EV={oos_ev_r:+.2f}R)",
             )
 
-        if live_mid > 100.0 and atr > 0 and abs(live_mid - close_px) > (0.65 * atr):
+        if live_mid > 100.0 and atr > 0 and abs(live_mid - close_px) > (0.45 * atr):
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(live_mid, 2),
                 score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
@@ -1855,12 +1881,24 @@ class SignalEngine:
         blended_r = (w1 * cfg.tp_r_multiples[0]) + (w2 * cfg.tp_r_multiples[1]) + (w3 * cfg.tp_r_multiples[2])
         ev_r = round((p_dec * blended_r) - ((1.0 - p_dec) * 1.0), 2)
 
-        if ev_r <= 0.15:
+        if p_win < cfg.min_p_win:
             return SignalCandidate(
                 mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
-                score=score, confluence_pct=conf_pct, ker=round(ker, 2), adx=round(adx, 1),
+                score=score, confluence_pct=conf_pct, p_win=p_win, ev_r=ev_r,
+                ker=round(ker, 2), adx=round(adx, 1),
                 z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
-                macro_ctx=macro_tag, candle_ts=candle_ts, reason=f"LOW_EXPECTANCY_EV={ev_r:+.2f}R",
+                macro_ctx=macro_tag, candle_ts=candle_ts,
+                reason=f"LOW_PROBABILITY_PWIN={p_win:.1f}%<{cfg.min_p_win:.0f}%",
+            )
+
+        if ev_r < cfg.min_ev_r:
+            return SignalCandidate(
+                mode=cfg.mode_name, direction="NO_SIGNAL", entry=round(spot_ref, 2),
+                score=score, confluence_pct=conf_pct, p_win=p_win, ev_r=ev_r,
+                ker=round(ker, 2), adx=round(adx, 1),
+                z_score=round(z_val, 2), atr=round(atr, 2), regime=regime, mtf_bias=mtf_bias,
+                macro_ctx=macro_tag, candle_ts=candle_ts,
+                reason=f"LOW_EXPECTANCY_EV={ev_r:+.2f}R<{cfg.min_ev_r:.2f}R",
             )
 
         tier = "SNIPER" if (is_sniper_setup and p_win >= 60.0) else "PRO"
