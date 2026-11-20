@@ -1,41 +1,69 @@
-name: APEX-QUANT-OMNI Crypto Signal Bot
+name: APEX-QUANT-OMNI Hyperion Signal Bot
 
 on:
   schedule:
-    # Jalankan setiap 15 menit (menit ke-1, 16, 31, 46) setelah candle 15m/1h/4h tutup
-    - cron: '1,16,31,46 * * * *'
+    - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Paksa eksekusi manual"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  run-signal-engine:
+  hyperion-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install Dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Restore Deduplication State
+      - name: Restore State & Database Cache
+        id: cache-state
         uses: actions/cache@v4
         with:
-          path: apex_state.json
-          key: apex-state-${{ github.run_id }}
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          key: hyperion-state-${{ github.run_id }}
           restore-keys: |
-            apex-state-
+            hyperion-state-
 
-      - name: Run Signal Engine
+      - name: Run Signal Bot Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OFFSET_BTCUSD: ${{ vars.OFFSET_BTCUSD || '0.0' }}
-          OFFSET_ETHUSD: ${{ vars.OFFSET_ETHUSD || '0.0' }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: "10000.0"
+          RISK_PERCENT: "1.0"
+          SQLITE_DB_PATH: "trading_signals.db"
+          BACKTEST_CHART_PATH: "backtest_performance.png"
         run: python -u btc.py
+
+      - name: Upload State & Backtest Chart Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperion-state-and-chart
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          if-no-files-found: warn
+          retention-days: 14
