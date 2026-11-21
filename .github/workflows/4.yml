@@ -1,0 +1,87 @@
+name: Quant Multi-Asset Signal Bot
+
+on:
+  schedule:
+    # Berjalan setiap 15 menit (selaras dengan penutupan candle M15 untuk SCALP & monitoring SWING)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      account_balance:
+        description: "Override saldo akun USD (opsional, default 10000)"
+        required: false
+        default: "10000.0"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: quant-signal-bot-state
+  cancel-in-progress: false
+
+jobs:
+  run-signal-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore SQLite Persistence State (Cache)
+        id: restore-db
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_signals.db
+          key: quant-sqlite-state-${{ github.run_id }}
+          restore-keys: |
+            quant-sqlite-state-
+
+      - name: Execute Quantitative Signal Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: ${{ github.event.inputs.account_balance || '10000.0' }}
+          RISK_PER_TRADE_SCALP: "0.0075"
+          RISK_PER_TRADE_SWING: "0.0125"
+          NAS100_PRICE_MULTIPLIER: "1.0"
+          NAS100_PRICE_OFFSET: "0.0"
+          XAUUSD_PRICE_OFFSET: "0.0"
+        run: |
+          python main.py
+
+      - name: Verify Output Files Exist
+        if: always()
+        run: |
+          ls -lh trading_signals.db backtest_performance.png || true
+
+      - name: Save SQLite Persistence State (Cache)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_signals.db
+          key: quant-sqlite-state-${{ github.run_id }}
+
+      - name: Upload Database & Performance Chart Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-bot-outputs-${{ github.run_number }}
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          retention-days: 14
